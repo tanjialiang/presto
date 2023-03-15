@@ -15,6 +15,7 @@ package com.facebook.presto.spark.execution;
 
 import com.facebook.airlift.log.Logger;
 import com.facebook.presto.execution.TaskInfo;
+import com.facebook.presto.execution.TaskState;
 import com.facebook.presto.server.smile.BaseResponse;
 import com.facebook.presto.spark.execution.http.PrestoSparkHttpTaskClient;
 import com.google.common.util.concurrent.FutureCallback;
@@ -25,6 +26,7 @@ import io.airlift.units.Duration;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -63,8 +65,14 @@ public class HttpNativeExecutionTaskInfoFetcher
         this.infoFetchInterval = requireNonNull(infoFetchInterval, "infoFetchInterval is null");
     }
 
-    public void start()
+    /**
+     * Starts periodic running of the fetcher.
+     * @return a {@CompletableFuture} that completes when the task gets out of 'RUNNING' state.
+     */
+    public CompletableFuture<TaskInfo> start()
     {
+        log.info("Scheduling TaskInfoFetcher periodic task");
+        CompletableFuture<TaskInfo> infoFuture = new CompletableFuture<>();
         scheduledFuture = updateScheduledExecutor.scheduleWithFixedDelay(() ->
         {
             try {
@@ -78,6 +86,11 @@ public class HttpNativeExecutionTaskInfoFetcher
                             {
                                 log.debug("TaskInfoCallback success %s", result.getValue().getTaskId());
                                 taskInfo.set(result.getValue());
+                                if (taskInfo.get().getTaskStatus().getState() != TaskState.RUNNING) {
+                                    log.info("infoFuture completes, task state " + taskInfo.get().toString());
+                                    infoFuture.complete(taskInfo.get());
+                                }
+                                log.info("TaskInfo state " + taskInfo.get().toString());
                             }
 
                             @Override
@@ -92,6 +105,7 @@ public class HttpNativeExecutionTaskInfoFetcher
                 throw t;
             }
         }, 0, (long) infoFetchInterval.getValue(), infoFetchInterval.getUnit());
+        return infoFuture;
     }
 
     public void stop()

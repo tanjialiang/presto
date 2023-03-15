@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.spark.execution;
 
+import com.facebook.airlift.log.Logger;
 import com.facebook.presto.operator.PageBufferClient;
 import com.facebook.presto.operator.PageTransportErrorException;
 import com.facebook.presto.spark.execution.http.PrestoSparkHttpTaskClient;
@@ -63,6 +64,8 @@ public class HttpNativeExecutionTaskResultFetcher
     private ScheduledFuture<?> schedulerFuture;
     private boolean started;
 
+    private static final Logger log = Logger.get(HttpNativeExecutionTaskResultFetcher.class);
+
     public HttpNativeExecutionTaskResultFetcher(
             ScheduledExecutorService scheduler,
             PrestoSparkHttpTaskClient workerClient)
@@ -80,6 +83,7 @@ public class HttpNativeExecutionTaskResultFetcher
                     "trying to start an already started TaskResultFetcher");
         }
         CompletableFuture<Void> future = new CompletableFuture<>();
+        log.info("Scheduling TaskResultFetcher periodic task");
         schedulerFuture = scheduler.scheduleAtFixedRate(
                 new HttpNativeExecutionTaskResultFetcherRunner(
                         workerClient,

@@ -27,14 +27,12 @@ import com.facebook.presto.server.smile.BaseResponse;
 import com.facebook.presto.spark.execution.http.PrestoSparkHttpTaskClient;
 import com.facebook.presto.spi.page.SerializedPage;
 import com.facebook.presto.sql.planner.PlanFragment;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
 
 import java.net.URI;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -66,6 +64,7 @@ public class NativeExecutionTask
     private final List<TaskSource> sources;
     private final Executor executor;
     private final HttpNativeExecutionTaskInfoFetcher taskInfoFetcher;
+    private CompletableFuture<TaskInfo> taskInfoFuture;
     private final HttpNativeExecutionTaskResultFetcher taskResultFetcher;
 
     public NativeExecutionTask(
@@ -136,20 +135,14 @@ public class NativeExecutionTask
     /**
      * Starts the execution of the NativeExecutionTask. Any exceptional cases should be captured by the exception handling mechanism of CompletableFuture.
      *
-     * @return a CompletableFuture of no content to indicate the successful finish of the task.
+     * @return a CompletableFuture of TaskInfo to indicate the finish of the task, either successfully or not.
      */
-    public CompletableFuture<Void> start()
+    public CompletableFuture<TaskInfo> start()
     {
-        CompletableFuture<Void> updateFuture = sendUpdateRequest().handle((Void result, Throwable t) ->
-        {
-            if (t != null) {
-                throw new CompletionException(t.getCause());
-            }
-            taskInfoFetcher.start();
-            return null;
-        });
-
-        return updateFuture.thenCombine(taskResultFetcher.start(), (r1, r2) -> null);
+        sendUpdateRequest();
+        log.info("Starting TaskResultFetcher.");
+        taskResultFetcher.start();
+        return taskInfoFetcher.start();
     }
 
     /**
@@ -162,45 +155,28 @@ public class NativeExecutionTask
         workerClient.abortResults();
     }
 
-    private CompletableFuture<Void> sendUpdateRequest()
+    private void sendUpdateRequest()
     {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        Futures.addCallback(
-                workerClient.updateTask(
-                        sources,
-                        planFragment,
-                        tableWriteInfo,
-                        shuffleWriteInfo,
-                        session,
-                        outputBuffers),
-                new UpdateResponseHandler(future),
-                executor);
-        return future;
-    }
-
-    private class UpdateResponseHandler
-            implements FutureCallback<BaseResponse<TaskInfo>>
-    {
-        private final CompletableFuture<Void> future;
-
-        public UpdateResponseHandler(CompletableFuture<Void> future)
-        {
-            this.future = requireNonNull(future, "future is null");
+        try {
+            BaseResponse<TaskInfo> taskInfoBaseResponse = workerClient.updateTask(
+                    sources,
+                    planFragment,
+                    tableWriteInfo,
+                    shuffleWriteInfo,
+                    session,
+                    outputBuffers).get();
+            if (taskInfoBaseResponse.hasValue()) {
+                log.info("Update success taskId %s", taskInfoBaseResponse.getValue().getTaskId());
+            }
+            else {
+                log.info("Update abnormal taskInfoBaseResponse doesn't have value");
+            }
         }
-
-        @Override
-        public void onSuccess(BaseResponse<TaskInfo> result)
-        {
-            TaskInfo value = result.getValue();
-            log.debug("success %s", value.getTaskId());
-            future.complete(null);
+        catch (InterruptedException e) {
+            throw new RuntimeException(e);
         }
-
-        @Override
-        public void onFailure(Throwable t)
-        {
-            log.error("failed %s", t);
-            future.completeExceptionally(t);
+        catch (ExecutionException e) {
+            throw new RuntimeException(e);
         }
     }
 }

@@ -28,7 +28,6 @@ import com.facebook.presto.operator.OperatorContext;
 import com.facebook.presto.operator.OperatorFactory;
 import com.facebook.presto.operator.SourceOperator;
 import com.facebook.presto.operator.SourceOperatorFactory;
-import com.facebook.presto.operator.SplitOperatorInfo;
 import com.facebook.presto.spark.execution.NativeExecutionProcess;
 import com.facebook.presto.spark.execution.NativeExecutionProcessFactory;
 import com.facebook.presto.spark.execution.NativeExecutionTask;
@@ -42,13 +41,11 @@ import com.facebook.presto.sql.planner.LocalExecutionPlanner;
 import com.facebook.presto.sql.planner.PlanFragment;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.planner.plan.NativeExecutionNode;
-import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 
 import java.io.IOException;
 import java.net.URI;
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -58,6 +55,7 @@ import static com.facebook.airlift.http.client.HttpUriBuilder.uriBuilderFrom;
 import static com.facebook.presto.SystemSessionProperties.isExchangeChecksumEnabled;
 import static com.facebook.presto.SystemSessionProperties.isExchangeCompressionEnabled;
 import static com.facebook.presto.operator.PipelineExecutionStrategy.UNGROUPED_EXECUTION;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 
@@ -93,9 +91,12 @@ public class NativeExecutionOperator
 
     private NativeExecutionProcess process;
     private NativeExecutionTask task;
-    private CompletableFuture<Void> taskStatusFuture;
+    private CompletableFuture<TaskInfo> taskStatusFuture;
+    private ImmutableSet.Builder<ScheduledSplit> splitSetBuilder;
     private TaskSource taskSource;
+    private PlanNodeId nativePlanNodeId;
     private boolean finished;
+    private boolean noMoreSplits;
 
     public NativeExecutionOperator(
             PlanNodeId sourceId,
@@ -116,6 +117,7 @@ public class NativeExecutionOperator
         this.serde = requireNonNull(serde, "serde is null");
         this.processFactory = requireNonNull(processFactory, "processFactory is null");
         this.taskFactory = requireNonNull(taskFactory, "taskFactory is null");
+        this.splitSetBuilder = ImmutableSet.builder();
     }
 
     @Override
@@ -146,11 +148,13 @@ public class NativeExecutionOperator
     @Override
     public Page getOutput()
     {
-        if (finished) {
+        log.info("getOutput()");
+        if (!noMoreSplits) {
             return null;
         }
 
         if (process == null) {
+            log.info("starting process");
             createProcess();
             checkState(process != null, "process is null");
             createTask();
@@ -160,15 +164,19 @@ public class NativeExecutionOperator
 
         try {
             if (taskStatusFuture.isDone()) {
+                log.info("taskStatusFuture.isDone");
                 // Will throw exception if the  taskStatusFuture is done with error.
-                taskStatusFuture.get();
-                Optional<TaskInfo> taskInfo = task.getTaskInfo();
-                taskInfo.ifPresent(info -> info.getTaskStatus().getFailures().forEach(e -> log.error(e.toException())));
+                TaskInfo taskInfo = taskStatusFuture.get();
+                taskInfo.getTaskStatus().getFailures().forEach(e -> log.error(e.toException()));
+
+                // Consume the left over results buffered locally in HttpNativeExecutionTaskResultFetcher if any.
                 Optional<SerializedPage> page = task.pollResult();
                 if (page.isPresent()) {
+                    log.info("pagePresent " + page.get().getSizeInBytes() + " bytes");
                     return processResult(page.get());
                 }
                 else {
+                    log.info("finished");
                     finished = true;
                     return null;
                 }
@@ -224,7 +232,6 @@ public class NativeExecutionOperator
     @Override
     public void finish()
     {
-        finished = true;
     }
 
     @Override
@@ -243,31 +250,22 @@ public class NativeExecutionOperator
     public Supplier<Optional<UpdatablePageSource>> addSplit(ScheduledSplit split)
     {
         requireNonNull(split, "split is null");
-        checkState(this.taskSource == null, "NativeEngine operator split already set");
-
-        if (finished) {
-            return Optional::empty;
+        if (nativePlanNodeId == null) {
+            nativePlanNodeId = split.getPlanNodeId();
         }
-
-        this.taskSource = new TaskSource(split.getPlanNodeId(), ImmutableSet.of(split), true);
-
-        Object splitInfo = split.getSplit().getInfo();
-        Map<String, String> infoMap = split.getSplit().getInfoMap();
-
-        //Make the implicit assumption that if infoMap is populated we can use that instead of the raw object.
-        if (infoMap != null && !infoMap.isEmpty()) {
-            operatorContext.setInfoSupplier(Suppliers.ofInstance(new SplitOperatorInfo(infoMap)));
+        else {
+            checkArgument(nativePlanNodeId == split.getPlanNodeId());
         }
-        else if (splitInfo != null) {
-            operatorContext.setInfoSupplier(Suppliers.ofInstance(new SplitOperatorInfo(splitInfo)));
-        }
-
+        splitSetBuilder.add(split);
         return Optional::empty;
     }
 
     @Override
     public void noMoreSplits()
     {
+        log.info("noMoreSplits()");
+        noMoreSplits = true;
+        this.taskSource = new TaskSource(nativePlanNodeId, splitSetBuilder.build(), true);
     }
 
     @Override

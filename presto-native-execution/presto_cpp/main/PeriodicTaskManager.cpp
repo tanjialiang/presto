@@ -125,7 +125,7 @@ void PeriodicTaskManager::start() {
   if (SystemConfig::instance()->enableOldTaskCleanUp()) {
     addOldTaskCleanupTask();
   }
-
+// test
   addPrestoExchangeSourceMemoryStatsTask();
 
   addConnectorStatsTask();
